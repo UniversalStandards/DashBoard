@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-const UniversalProjectNexus = () => {
+const USPIMPProjectNexus = () => {
   const [activeView, setActiveView] = useState('nexus');
   const [selectedProject, setSelectedProject] = useState('proj-001');
   const [draggedItem, setDraggedItem] = useState(null);
@@ -339,9 +339,9 @@ const UniversalProjectNexus = () => {
                 </div>
                 <div>
                   <h1 className="text-2xl font-bold bg-gradient-to-r from-white to-purple-300 bg-clip-text text-transparent">
-                    Universal Project Nexus
+                    US-PIMP Project Nexus
                   </h1>
-                  <p className="text-purple-300 text-sm">Next-Generation Project Intelligence</p>
+                  <p className="text-purple-300 text-sm">Universal Standard Project Innovation & Management Platform</p>
                 </div>
               </div>
             </div>
@@ -507,4 +507,4 @@ const UniversalProjectNexus = () => {
   );
 };
 
-export default UniversalProjectNexus;
+export default USPIMPProjectNexus;
