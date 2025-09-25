@@ -1,0 +1,312 @@
+# Continuation of enhanced Jekyll workflow - Intelligent Deployment Phase
+
+# Pre-deployment validation
+pre_deploy:
+  name: Pre-deployment Validation
+  runs-on: ubuntu-latest
+  needs: [build, test, security_scan]
+  if: always() && (needs.build.result == 'success')
+  outputs:
+    deploy_decision: ${{ steps.decision.outputs.deploy_decision }}
+    deployment_strategy: ${{ steps.strategy.outputs.deployment_strategy }}
+    rollback_required: ${{ steps.validation.outputs.rollback_required }}
+  
+  steps:
+    - name: Evaluate test results
+      id: decision
+      run: |
+        # Determine deployment decision based on test results
+        BUILD_STATUS="${{ needs.build.result }}"
+        TEST_STATUS="${{ needs.test.result }}"
+        SECURITY_STATUS="${{ needs.security_scan.result }}"
+        
+        echo "Build Status: $BUILD_STATUS"
+        echo "Test Status: $TEST_STATUS"
+        echo "Security Status: $SECURITY_STATUS"
+        
+        # Decision matrix
+        if [[ "$BUILD_STATUS" == "success" ]]; then
+          if [[ "$TEST_STATUS" == "success" || "$TEST_STATUS" == "skipped" ]]; then
+            if [[ "$SECURITY_STATUS" == "success" || "$SECURITY_STATUS" == "skipped" ]]; then
+              echo "deploy_decision=proceed" >> $GITHUB_OUTPUT
+              echo "✅ All checks passed - proceeding with deployment"
+            else
+              echo "deploy_decision=security_review" >> $GITHUB_OUTPUT
+              echo "⚠️ Security issues detected - requires review"
+            fi
+          else
+            echo "deploy_decision=conditional" >> $GITHUB_OUTPUT
+            echo "⚠️ Test failures detected - conditional deployment"
+          fi
+        else
+          echo "deploy_decision=abort" >> $GITHUB_OUTPUT
+          echo "❌ Build failed - aborting deployment"
+        fi
+
+    - name: Determine deployment strategy
+      id: strategy
+      run: |
+        DEPLOY_DECISION="${{ steps.decision.outputs.deploy_decision }}"
+        BRANCH="${{ github.ref_name }}"
+        EVENT="${{ github.event_name }}"
+        
+        case "$DEPLOY_DECISION" in
+          proceed)
+            if [[ "$BRANCH" == "main" && "$EVENT" == "push" ]]; then
+              echo "deployment_strategy=blue_green" >> $GITHUB_OUTPUT
+            elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+              echo "deployment_strategy=direct" >> $GITHUB_OUTPUT
+            else
+              echo "deployment_strategy=canary" >> $GITHUB_OUTPUT
+            fi
+            ;;
+          conditional)
+            echo "deployment_strategy=staging_first" >> $GITHUB_OUTPUT
+            ;;
+          security_review)
+            echo "deployment_strategy=manual_approval" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "deployment_strategy=none" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    - name: Validate current production
+      id: validation
+      run: |
+        # Check if current production site is accessible
+        SITE_URL="${{ env.SITE_URL }}"
+        
+        if curl -f -s -o /dev/null "$SITE_URL"; then
+          echo "rollback_required=false" >> $GITHUB_OUTPUT
+          echo "✅ Current production site is accessible"
+        else
+          echo "rollback_required=true" >> $GITHUB_OUTPUT
+          echo "⚠️ Current production site is not accessible"
+        fi
+
+# Staging deployment for validation
+deploy_staging:
+  name: Deploy to Staging
+  runs-on: ubuntu-latest
+  needs: pre_deploy
+  if: |
+    needs.pre_deploy.outputs.deploy_decision != 'abort' && 
+    needs.pre_deploy.outputs.deployment_strategy == 'staging_first'
+  environment:
+    name: staging
+    url: ${{ steps.staging_deploy.outputs.staging_url }}
+  
+  steps:
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: github-pages
+        path: ./staging
+
+    - name: Deploy to staging environment
+      id: staging_deploy
+      run: |
+        # Simulate staging deployment (replace with actual staging deployment)
+        echo "Deploying to staging environment..."
+        
+        # For GitHub Pages, we might use a different branch or subdomain
+        STAGING_URL="https://staging-${{ github.repository_owner }}.github.io"
+        echo "staging_url=$STAGING_URL" >> $GITHUB_OUTPUT
+        
+        # Here you would implement actual staging deployment logic
+        echo "✅ Staging deployment completed"
+
+    - name: Validate staging deployment
+      run: |
+        STAGING_URL="${{ steps.staging_deploy.outputs.staging_url }}"
+        
+        # Wait for staging to be ready
+        sleep 30
+        
+        # Validate staging deployment
+        if curl -f -s -o /dev/null "$STAGING_URL"; then
+          echo "✅ Staging deployment validated"
+        else
+          echo "❌ Staging deployment validation failed"
+          exit 1
+        fi
+
+# Main production deployment job with multiple strategies
+deploy:
+  name: Deploy to Production
+  runs-on: ubuntu-latest
+  needs: [pre_deploy, deploy_staging]
+  if: |
+    always() && 
+    needs.pre_deploy.outputs.deploy_decision == 'proceed' ||
+    (needs.deploy_staging.result == 'success' && needs.pre_deploy.outputs.deployment_strategy == 'staging_first')
+  environment:
+    name: github-pages
+    url: ${{ steps.deployment.outputs.page_url }}
+  timeout-minutes: 10
+  
+  steps:
+    - name: Checkout for rollback preparation
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+
+    - name: Prepare rollback information
+      id: rollback_prep
+      run: |
+        # Store current commit for potential rollback
+        CURRENT_COMMIT=$(git rev-parse HEAD)
+        PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+        
+        echo "current_commit=$CURRENT_COMMIT" >> $GITHUB_OUTPUT
+        echo "previous_commit=$PREVIOUS_COMMIT" >> $GITHUB_OUTPUT
+        
+        # Store deployment metadata
+        cat > deployment-metadata.json << EOF
+        {
+          "deployment_id": "${{ github.run_id }}",
+          "commit": "$CURRENT_COMMIT",
+          "previous_commit": "$PREVIOUS_COMMIT",
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "strategy": "${{ needs.pre_deploy.outputs.deployment_strategy }}",
+          "actor": "${{ github.actor }}",
+          "event": "${{ github.event_name }}"
+        }
+        EOF
+
+    - name: Blue-Green Deployment Strategy
+      if: needs.pre_deploy.outputs.deployment_strategy == 'blue_green'
+      run: |
+        echo "🔵 Executing Blue-Green deployment strategy"
+        
+        # In a real blue-green setup, you would:
+        # 1. Deploy to green environment
+        # 2. Run smoke tests on green
+        # 3. Switch traffic from blue to green
+        # 4. Keep blue as rollback option
+        
+        echo "Blue-Green deployment simulation completed"
+
+    - name: Canary Deployment Strategy
+      if: needs.pre_deploy.outputs.deployment_strategy == 'canary'
+      run: |
+        echo "🐤 Executing Canary deployment strategy"
+        
+        # In a real canary setup, you would:
+        # 1. Deploy to subset of servers
+        # 2. Monitor metrics and errors
+        # 3. Gradually increase traffic
+        # 4. Full rollout or rollback based on metrics
+        
+        echo "Canary deployment simulation completed"
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+      with:
+        timeout: 600000
+        error_count: 10
+        reporting_interval: 5000
+        artifact_name: github-pages
+
+    - name: Post-deployment validation
+      id: validation
+      run: |
+        SITE_URL="${{ steps.deployment.outputs.page_url }}"
+        MAX_ATTEMPTS=10
+        ATTEMPT=1
+        
+        echo "Validating deployment at: $SITE_URL"
+        
+        while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+          echo "Validation attempt $ATTEMPT of $MAX_ATTEMPTS"
+          
+          if curl -f -s -o /dev/null "$SITE_URL"; then
+            echo "✅ Deployment validation successful"
+            echo "validation_status=success" >> $GITHUB_OUTPUT
+            break
+          else
+            echo "⏳ Site not ready, waiting..."
+            sleep 30
+            ATTEMPT=$((ATTEMPT + 1))
+          fi
+        done
+        
+        if [[ $ATTEMPT -gt $MAX_ATTEMPTS ]]; then
+          echo "❌ Deployment validation failed after $MAX_ATTEMPTS attempts"
+          echo "validation_status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Performance validation
+      run: |
+        SITE_URL="${{ steps.deployment.outputs.page_url }}"
+        
+        # Quick performance check
+        RESPONSE_TIME=$(curl -o /dev/null -s -w '%{time_total}' "$SITE_URL")
+        
+        if (( $(echo "$RESPONSE_TIME < 3.0" | bc -l) )); then
+          echo "✅ Performance validation passed (${RESPONSE_TIME}s)"
+        else
+          echo "⚠️ Performance validation warning: slow response time (${RESPONSE_TIME}s)"
+        fi
+
+    - name: Update deployment status
+      if: always()
+      run: |
+        VALIDATION_STATUS="${{ steps.validation.outputs.validation_status }}"
+        SITE_URL="${{ steps.deployment.outputs.page_url }}"
+        
+        if [[ "$VALIDATION_STATUS" == "success" ]]; then
+          echo "🎉 Deployment completed successfully!"
+          echo "🌐 Site URL: $SITE_URL"
+          
+          # Create success notification
+          cat > deployment-success.md << EOF
+        # ✅ Deployment Successful
+        
+        **Site URL:** $SITE_URL
+        **Commit:** ${{ steps.rollback_prep.outputs.current_commit }}
+        **Strategy:** ${{ needs.pre_deploy.outputs.deployment_strategy }}
+        **Duration:** ${{ job.duration }} seconds
+        
+        ## Next Steps
+        - Monitor site performance
+        - Check analytics for any issues
+        - Verify all functionality works as expected
+        EOF
+        else
+          echo "❌ Deployment validation failed - preparing for rollback"
+        fi
+
+# Automatic rollback job
+rollback:
+  name: Automatic Rollback
+  runs-on: ubuntu-latest
+  needs: [deploy, pre_deploy]
+  if: |
+    always() && 
+    (needs.deploy.result == 'failure' || needs.pre_deploy.outputs.rollback_required == 'true')
+  environment:
+    name: github-pages-rollback
+  
+  steps:
+    - name: Checkout previous version
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.deploy.outputs.previous_commit || 'HEAD~1' }}
+
+    - name: Setup Ruby for rollback build
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ env.RUBY_VERSION }}
+        bundler-cache: true
+
+    - name: Build previous version
+      run: |
+        echo "🔄 Building previous version for rollback"
+        bundle exec jekyll build --destination ./_site
+
+    - name: Deploy rollback version
+      uses

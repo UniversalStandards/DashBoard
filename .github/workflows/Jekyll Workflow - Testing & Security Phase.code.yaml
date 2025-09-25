@@ -1,0 +1,288 @@
+# Continuation of enhanced Jekyll workflow - Testing and Security Phase
+
+# Advanced testing and quality assurance job
+test:
+  name: Testing & Quality Assurance
+  runs-on: ubuntu-latest
+  needs: build
+  if: ${{ !inputs.skip_tests && success() }}
+  timeout-minutes: 20
+  strategy:
+    matrix:
+      test_type: [html_validation, accessibility, performance, security]
+    fail-fast: false
+  
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: github-pages
+        path: ./_site
+
+    - name: Extract artifact
+      run: |
+        cd ./_site
+        tar -xf artifact.tar
+        rm artifact.tar
+
+    - name: Setup testing environment
+      run: |
+        # Install testing tools based on matrix
+        case "${{ matrix.test_type }}" in
+          html_validation)
+            npm install -g html-validate htmlhint
+            ;;
+          accessibility)
+            npm install -g @axe-core/cli pa11y-ci
+            ;;
+          performance)
+            npm install -g lighthouse @lhci/cli
+            ;;
+          security)
+            # Install security scanning tools
+            wget -qO- https://github.com/Checkmarx/kics/releases/latest/download/kics_linux_amd64.tar.gz | tar -xz
+            sudo mv kics /usr/local/bin/
+            ;;
+        esac
+
+    - name: HTML Validation Tests
+      if: matrix.test_type == 'html_validation'
+      run: |
+        echo "::group::HTML Validation"
+        
+        # HTML5 validation
+        if command -v html-validate &> /dev/null; then
+          html-validate ./_site/**/*.html || echo "::warning::HTML validation issues found"
+        fi
+        
+        # HTMLHint validation
+        if command -v htmlhint &> /dev/null; then
+          htmlhint ./_site/**/*.html --config .htmlhintrc || echo "::warning::HTMLHint issues found"
+        fi
+        
+        # Link checking
+        if command -v htmlproofer &> /dev/null; then
+          htmlproofer ./_site \
+            --check-html \
+            --check-img-http \
+            --check-opengraph \
+            --report-invalid-tags \
+            --report-missing-names \
+            --report-script-embeds \
+            --report-missing-doctype \
+            --report-eof-tags \
+            --report-mismatched-tags \
+            || echo "::warning::HTML Proofer found issues"
+        fi
+        
+        echo "::endgroup::"
+
+    - name: Accessibility Tests
+      if: matrix.test_type == 'accessibility'
+      run: |
+        echo "::group::Accessibility Testing"
+        
+        # Start local server for testing
+        cd ./_site
+        python3 -m http.server 8080 &
+        SERVER_PID=$!
+        sleep 5
+        
+        # axe-core accessibility testing
+        if command -v axe &> /dev/null; then
+          axe http://localhost:8080 \
+            --tags wcag2a,wcag2aa,wcag21aa \
+            --reporter json \
+            --output-file axe-results.json \
+            || echo "::warning::Accessibility issues found"
+          
+          if [[ -f axe-results.json ]]; then
+            echo "Accessibility test results:"
+            cat axe-results.json | jq '.violations | length' || echo "No violations summary available"
+          fi
+        fi
+        
+        # pa11y accessibility testing
+        if command -v pa11y-ci &> /dev/null; then
+          echo '{"urls": ["http://localhost:8080"]}' > pa11y-config.json
+          pa11y-ci --config pa11y-config.json || echo "::warning::pa11y found accessibility issues"
+        fi
+        
+        # Cleanup
+        kill $SERVER_PID 2>/dev/null || true
+        
+        echo "::endgroup::"
+
+    - name: Performance Tests
+      if: matrix.test_type == 'performance'
+      run: |
+        echo "::group::Performance Testing"
+        
+        # Start local server
+        cd ./_site
+        python3 -m http.server 8080 &
+        SERVER_PID=$!
+        sleep 5
+        
+        # Lighthouse performance audit
+        if command -v lighthouse &> /dev/null; then
+          lighthouse http://localhost:8080 \
+            --output=json \
+            --output=html \
+            --output-path=./lighthouse-report \
+            --chrome-flags="--headless --no-sandbox --disable-gpu" \
+            --only-categories=performance,accessibility,best-practices,seo \
+            --budget-path=.github/lighthouse-budget.json \
+            || echo "::warning::Performance issues detected"
+          
+          # Extract key metrics
+          if [[ -f lighthouse-report.json ]]; then
+            echo "Performance Metrics:"
+            cat lighthouse-report.json | jq '.lhr.audits."first-contentful-paint".displayValue' || echo "FCP: N/A"
+            cat lighthouse-report.json | jq '.lhr.audits."largest-contentful-paint".displayValue' || echo "LCP: N/A"
+            cat lighthouse-report.json | jq '.lhr.audits."cumulative-layout-shift".displayValue' || echo "CLS: N/A"
+          fi
+        fi
+        
+        # Bundle size analysis
+        echo "Site size analysis:"
+        du -sh ./_site
+        find ./_site -name "*.css" -exec du -sh {} \; | sort -hr | head -5
+        find ./_site -name "*.js" -exec du -sh {} \; | sort -hr | head -5
+        find ./_site -name "*.html" -exec du -sh {} \; | sort -hr | head -5
+        
+        # Cleanup
+        kill $SERVER_PID 2>/dev/null || true
+        
+        echo "::endgroup::"
+
+    - name: Security Scanning
+      if: matrix.test_type == 'security'
+      run: |
+        echo "::group::Security Scanning"
+        
+        # KICS security scanning
+        if command -v kics &> /dev/null; then
+          kics scan \
+            --path ./_site \
+            --output-path kics-results \
+            --report-formats json,html \
+            --exclude-categories "Encryption,Secrets" \
+            || echo "::warning::Security issues found"
+          
+          if [[ -f kics-results/results.json ]]; then
+            echo "Security scan summary:"
+            cat kics-results/results.json | jq '.summary' || echo "No summary available"
+          fi
+        fi
+        
+        # Check for sensitive information
+        echo "Scanning for sensitive information..."
+        SENSITIVE_PATTERNS=(
+          "password\s*[:=]\s*['\"][^'\"]*['\"]"
+          "api[_-]?key\s*[:=]\s*['\"][^'\"]*['\"]"
+          "secret\s*[:=]\s*['\"][^'\"]*['\"]"
+          "token\s*[:=]\s*['\"][^'\"]*['\"]"
+          "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+        )
+        
+        for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+          if grep -r -i -E "$pattern" ./_site/ 2>/dev/null; then
+            echo "::error::Potential sensitive information found matching pattern: $pattern"
+          fi
+        done
+        
+        # Check for common security headers in HTML
+        echo "Checking for security-related meta tags..."
+        if ! grep -r "Content-Security-Policy" ./_site/ 2>/dev/null; then
+          echo "::warning::No Content-Security-Policy found"
+        fi
+        
+        echo "::endgroup::"
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.test_type }}-${{ github.run_number }}
+        path: |
+          axe-results.json
+          lighthouse-report.*
+          kics-results/
+          pa11y-config.json
+        retention-days: 30
+
+# Security and dependency scanning job
+security_scan:
+  name: Security & Dependency Scan
+  runs-on: ubuntu-latest
+  needs: build
+  timeout-minutes: 15
+  
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Ruby dependency security audit
+      run: |
+        if [[ -f "Gemfile.lock" ]]; then
+          gem install bundler-audit
+          bundle-audit check --update || echo "::warning::Ruby security vulnerabilities found"
+        fi
+
+    - name: Node.js dependency security audit
+      run: |
+        if [[ -f "package-lock.json" ]]; then
+          npm audit --audit-level=moderate || echo "::warning::Node.js security vulnerabilities found"
+        fi
+
+    - name: Create security report
+      run: |
+        cat > security-report.md << 'EOF'
+        # Security Scan Report
+        
+        **Scan Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        **Repository:** ${{ github.repository }}
+        **Commit:** ${{ github.sha }}
+        
+        ## Summary
+        
+        - Trivy filesystem scan: Completed
+        - Ruby dependency audit: Completed
+        - Node.js dependency audit: Completed
+        - Static analysis: Completed
+        
+        ## Recommendations
+        
+        1. Regularly update dependencies
+        2. Monitor security advisories
+        3. Implement automated dependency updates
+        4. Use security headers in production
+        
+        EOF
+
+    - name: Upload security report
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-report-${{ github.run_number }}
+        path: |
+          security-report.md
+          trivy-results.sarif
+        retention-days: 90

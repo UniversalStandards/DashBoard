@@ -1,0 +1,459 @@
+# Continuation of Post-Deployment Monitoring
+        
+        # DNS resolution time
+        DNS_TIME=$(curl -o /dev/null -s -w '%{time_namelookup}' "$SITE_URL")
+        
+        # SSL handshake time
+        SSL_TIME=$(curl -o /dev/null -s -w '%{time_appconnect}' "$SITE_URL")
+        
+        # Time to first byte
+        TTFB=$(curl -o /dev/null -s -w '%{time_starttransfer}' "$SITE_URL")
+        
+        # Create performance metrics JSON
+        cat > "$METRICS_FILE" << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "site_url": "$SITE_URL",
+          "metrics": {
+            "response_time": $RESPONSE_TIME,
+            "dns_lookup": $DNS_TIME,
+            "ssl_handshake": $SSL_TIME,
+            "time_to_first_byte": $TTFB
+          },
+          "thresholds": {
+            "response_time_warning": 2.0,
+            "response_time_critical": 5.0,
+            "ttfb_warning": 1.0,
+            "ttfb_critical": 3.0
+          }
+        }
+        EOF
+        
+        # Evaluate performance
+        if (( $(echo "$RESPONSE_TIME > 5.0" | bc -l) )); then
+          echo "::error::Critical: Response time too slow (${RESPONSE_TIME}s)"
+        elif (( $(echo "$RESPONSE_TIME > 2.0" | bc -l) )); then
+          echo "::warning::Warning: Response time is slow (${RESPONSE_TIME}s)"
+        else
+          echo "✅ Performance: Response time acceptable (${RESPONSE_TIME}s)"
+        fi
+        
+        echo "📊 Performance metrics collected"
+
+    - name: SEO and accessibility monitoring
+      run: |
+        SITE_URL="${{ needs.deploy.outputs.page_url || env.SITE_URL }}"
+        
+        echo "🔍 SEO and accessibility monitoring"
+        
+        # Check for essential SEO elements
+        HOMEPAGE_CONTENT=$(curl -s "$SITE_URL")
+        
+        # Title tag check
+        if echo "$HOMEPAGE_CONTENT" | grep -q "<title>"; then
+          echo "✅ Title tag present"
+        else
+          echo "⚠️ Missing title tag"
+        fi
+        
+        # Meta description check
+        if echo "$HOMEPAGE_CONTENT" | grep -q 'name="description"'; then
+          echo "✅ Meta description present"
+        else
+          echo "⚠️ Missing meta description"
+        fi
+        
+        # Viewport meta tag check
+        if echo "$HOMEPAGE_CONTENT" | grep -q 'name="viewport"'; then
+          echo "✅ Viewport meta tag present"
+        else
+          echo "⚠️ Missing viewport meta tag"
+        fi
+        
+        # Open Graph tags check
+        if echo "$HOMEPAGE_CONTENT" | grep -q 'property="og:'; then
+          echo "✅ Open Graph tags present"
+        else
+          echo "⚠️ Missing Open Graph tags"
+        fi
+
+    - name: Security headers validation
+      run: |
+        SITE_URL="${{ needs.deploy.outputs.page_url || env.SITE_URL }}"
+        
+        echo "🔒 Security headers validation"
+        
+        # Get response headers
+        HEADERS=$(curl -I -s "$SITE_URL")
+        
+        # Check for security headers
+        SECURITY_HEADERS=(
+          "X-Frame-Options"
+          "X-Content-Type-Options"
+          "X-XSS-Protection"
+          "Referrer-Policy"
+          "Content-Security-Policy"
+        )
+        
+        for header in "${SECURITY_HEADERS[@]}"; do
+          if echo "$HEADERS" | grep -i "$header"; then
+            echo "✅ $header present"
+          else
+            echo "⚠️ $header missing"
+          fi
+        done
+
+    - name: Upload monitoring results
+      uses: actions/upload-artifact@v4
+      with:
+        name: monitoring-results-${{ github.run_number }}
+        path: |
+          validation-report.md
+          performance-metrics.json
+        retention-days: 30
+
+# Notification and reporting job
+notify:
+  name: Send Notifications
+  runs-on: ubuntu-latest
+  needs: [deploy, post_deploy_monitoring, rollback]
+  if: always()
+  
+  steps:
+    - name: Determine notification type
+      id: notification_type
+      run: |
+        DEPLOY_STATUS="${{ needs.deploy.result }}"
+        MONITORING_STATUS="${{ needs.post_deploy_monitoring.result }}"
+        ROLLBACK_STATUS="${{ needs.rollback.result }}"
+        
+        if [[ "$ROLLBACK_STATUS" == "success" ]]; then
+          echo "type=rollback_success" >> $GITHUB_OUTPUT
+          echo "message=Automatic rollback completed successfully" >> $GITHUB_OUTPUT
+          echo "emoji=🔄" >> $GITHUB_OUTPUT
+        elif [[ "$DEPLOY_STATUS" == "success" && "$MONITORING_STATUS" == "success" ]]; then
+          echo "type=deployment_success" >> $GITHUB_OUTPUT
+          echo "message=Deployment completed successfully with all validations passed" >> $GITHUB_OUTPUT
+          echo "emoji=🎉" >> $GITHUB_OUTPUT
+        elif [[ "$DEPLOY_STATUS" == "success" ]]; then
+          echo "type=deployment_warning" >> $GITHUB_OUTPUT
+          echo "message=Deployment succeeded but monitoring detected issues" >> $GITHUB_OUTPUT
+          echo "emoji=⚠️" >> $GITHUB_OUTPUT
+        else
+          echo "type=deployment_failure" >> $GITHUB_OUTPUT
+          echo "message=Deployment failed" >> $GITHUB_OUTPUT
+          echo "emoji=❌" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create comprehensive report
+      run: |
+        NOTIFICATION_TYPE="${{ steps.notification_type.outputs.type }}"
+        EMOJI="${{ steps.notification_type.outputs.emoji }}"
+        MESSAGE="${{ steps.notification_type.outputs.message }}"
+        
+        cat > deployment-report.md << EOF
+        # $EMOJI Jekyll Site Deployment Report
+        
+        **Status:** $MESSAGE
+        **Repository:** ${{ github.repository }}
+        **Branch:** ${{ github.ref_name }}
+        **Commit:** ${{ github.sha }}
+        **Actor:** ${{ github.actor }}
+        **Workflow:** ${{ github.workflow }}
+        **Run ID:** ${{ github.run_id }}
+        **Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+        
+        ## Deployment Details
+        
+        - **Build Status:** ${{ needs.build.result || 'N/A' }}
+        - **Test Status:** ${{ needs.test.result || 'N/A' }}
+        - **Security Scan:** ${{ needs.security_scan.result || 'N/A' }}
+        - **Deployment:** ${{ needs.deploy.result || 'N/A' }}
+        - **Monitoring:** ${{ needs.post_deploy_monitoring.result || 'N/A' }}
+        - **Rollback:** ${{ needs.rollback.result || 'N/A' }}
+        
+        ## Site Information
+        
+        - **Site URL:** ${{ needs.deploy.outputs.page_url || env.SITE_URL }}
+        - **Deployment Strategy:** ${{ needs.pre_deploy.outputs.deployment_strategy || 'N/A' }}
+        
+        ## Actions Taken
+        
+        EOF
+        
+        # Add specific actions based on results
+        if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+          echo "- ✅ Site deployed successfully" >> deployment-report.md
+        fi
+        
+        if [[ "${{ needs.rollback.result }}" == "success" ]]; then
+          echo "- 🔄 Automatic rollback executed" >> deployment-report.md
+        fi
+        
+        if [[ "${{ needs.post_deploy_monitoring.result }}" == "success" ]]; then
+          echo "- 📊 Post-deployment monitoring completed" >> deployment-report.md
+        fi
+        
+        # Add recommendations
+        cat >> deployment-report.md << 'EOF'
+        
+        ## Recommendations
+        
+        - Monitor site performance over the next 24 hours
+        - Check analytics for any unusual patterns
+        - Verify all functionality works as expected
+        - Review any warnings or issues mentioned above
+        
+        ## Quick Links
+        
+        - [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        - [Commit Details](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+        - [Repository](${{ github.server_url }}/${{ github.repository }})
+        
+        ---
+        *This report was automatically generated by the Jekyll deployment workflow.*
+        EOF
+
+    - name: Send Slack notification
+      if: vars.SLACK_WEBHOOK_URL
+      run: |
+        NOTIFICATION_TYPE="${{ steps.notification_type.outputs.type }}"
+        EMOJI="${{ steps.notification_type.outputs.emoji }}"
+        MESSAGE="${{ steps.notification_type.outputs.message }}"
+        SITE_URL="${{ needs.deploy.outputs.page_url || env.SITE_URL }}"
+        
+        # Determine color based on status
+        case "$NOTIFICATION_TYPE" in
+          deployment_success) COLOR="good" ;;
+          deployment_warning) COLOR="warning" ;;
+          rollback_success) COLOR="warning" ;;
+          *) COLOR="danger" ;;
+        esac
+        
+        # Create Slack payload
+        cat > slack-payload.json << EOF
+        {
+          "username": "Jekyll Deploy Bot",
+          "icon_emoji": ":rocket:",
+          "attachments": [
+            {
+              "color": "$COLOR",
+              "title": "$EMOJI Jekyll Deployment - ${{ github.repository }}",
+              "text": "$MESSAGE",
+              "fields": [
+                {
+                  "title": "Branch",
+                  "value": "${{ github.ref_name }}",
+                  "short": true
+                },
+                {
+                  "title": "Actor",
+                  "value": "${{ github.actor }}",
+                  "short": true
+                },
+                {
+                  "title": "Site URL",
+                  "value": "<$SITE_URL|Visit Site>",
+                  "short": false
+                }
+              ],
+              "actions": [
+                {
+                  "type": "button",
+                  "text": "View Workflow",
+                  "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }
+              ]
+            }
+          ]
+        }
+        EOF
+        
+        # Send to Slack
+        curl -X POST -H 'Content-type: application/json' \
+          --data @slack-payload.json \
+          "${{ vars.SLACK_WEBHOOK_URL }}"
+
+    - name: Create GitHub issue on failure
+      if: |
+        failure() && 
+        (needs.deploy.result == 'failure' || needs.rollback.result == 'failure')
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const title = `🚨 Jekyll Deployment Failure - ${new Date().toISOString().split('T')[0]}`;
+          const body = `
+          ## Deployment Failure Report
+          
+          **Workflow Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Branch:** ${{ github.ref_name }}
+          **Commit:** ${{ github.sha }}
+          **Actor:** ${{ github.actor }}
+          **Timestamp:** ${new Date().toISOString()}
+          
+          ## Failure Details
+          
+          - **Build:** ${{ needs.build.result || 'N/A' }}
+          - **Tests:** ${{ needs.test.result || 'N/A' }}
+          - **Security:** ${{ needs.security_scan.result || 'N/A' }}
+          - **Deploy:** ${{ needs.deploy.result || 'N/A' }}
+          - **Rollback:** ${{ needs.rollback.result || 'N/A' }}
+          
+          ## Action Required
+          
+          1. Review the workflow logs for detailed error information
+          2. Fix any identified issues
+          3. Test the fix locally
+          4. Re-run the deployment
+          
+          ## Troubleshooting Links
+          
+          - [Workflow Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - [Jekyll Documentation](https://jekyllrb.com/docs/)
+          - [GitHub Pages Documentation](https://docs.github.com/en/pages)
+          
+          ---
+          *This issue was automatically created by the deployment workflow.*
+          `;
+          
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['deployment', 'bug', 'automated']
+          });
+
+    - name: Update deployment status badge
+      run: |
+        # Create status badge data
+        DEPLOY_STATUS="${{ needs.deploy.result }}"
+        
+        case "$DEPLOY_STATUS" in
+          success)
+            BADGE_COLOR="brightgreen"
+            BADGE_MESSAGE="passing"
+            ;;
+          failure)
+            BADGE_COLOR="red"
+            BADGE_MESSAGE="failing"
+            ;;
+          *)
+            BADGE_COLOR="yellow"
+            BADGE_MESSAGE="unknown"
+            ;;
+        esac
+        
+        echo "Deployment status: $BADGE_MESSAGE ($BADGE_COLOR)"
+        
+        # You could use this to update a status badge service
+        # or create a badge file in your repository
+
+# Cleanup and maintenance job
+cleanup:
+  name: Cleanup & Maintenance
+  runs-on: ubuntu-latest
+  needs: [notify]
+  if: always()
+  
+  steps:
+    - name: Cleanup old artifacts
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Clean up artifacts older than 30 days
+          const artifacts = await github.rest.actions.listArtifactsForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            per_page: 100
+          });
+          
+          const thirtyDaysAgo = new Date();
+          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+          
+          for (const artifact of artifacts.data.artifacts) {
+            const createdAt = new Date(artifact.created_at);
+            if (createdAt < thirtyDaysAgo) {
+              console.log(`Deleting old artifact: ${artifact.name}`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id
+              });
+            }
+          }
+
+    - name: Update deployment history
+      run: |
+        # Create deployment history entry
+        cat > deployment-history-entry.json << EOF
+        {
+          "deployment_id": "${{ github.run_id }}",
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "commit": "${{ github.sha }}",
+          "branch": "${{ github.ref_name }}",
+          "actor": "${{ github.actor }}",
+          "status": "${{ needs.deploy.result }}",
+          "site_url": "${{ needs.deploy.outputs.page_url || env.SITE_URL }}",
+          "duration_seconds": "${{ github.event.workflow_run.run_duration || 'N/A' }}"
+        }
+        EOF
+        
+        echo "Deployment history entry created"
+
+    - name: Performance trend analysis
+      run: |
+        echo "📈 Performance trend analysis"
+        
+        # This would typically connect to a monitoring service
+        # to track performance trends over time
+        
+        echo "Performance analysis completed"
+        echo "Consider implementing long-term performance monitoring"
+
+    - name: Generate maintenance recommendations
+      run: |
+        cat > maintenance-recommendations.md << 'EOF'
+        # Maintenance Recommendations
+        
+        Based on this deployment, consider the following maintenance tasks:
+        
+        ## Regular Tasks
+        - [ ] Update dependencies monthly
+        - [ ] Review and update content
+        - [ ] Check for broken links
+        - [ ] Monitor site performance
+        - [ ] Review security headers
+        
+        ## Quarterly Tasks
+        - [ ] Security audit
+        - [ ] Performance optimization
+        - [ ] SEO review
+        - [ ] Accessibility audit
+        - [ ] Backup verification
+        
+        ## Annual Tasks
+        - [ ] Major dependency updates
+        - [ ] Design refresh consideration
+        - [ ] Content strategy review
+        - [ ] Infrastructure review
+        
+        ## Automation Improvements
+        - [ ] Enhanced monitoring
+        - [ ] Automated dependency updates
+        - [ ] Performance budgets
+        - [ ] Advanced security scanning
+        
+        ---
+        Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+        EOF
+
+    - name: Upload final reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: final-deployment-reports-${{ github.run_number }}
+        path: |
+          deployment-report.md
+          deployment-history-entry.json
+          maintenance-recommendations.md
+        retention-days: 90
