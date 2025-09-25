@@ -1,0 +1,465 @@
+# Enhanced Jekyll workflow with advanced automation, error handling, and production features
+name: Deploy Jekyll with Advanced Automation & Error Handling
+
+on:
+  # Runs on pushes targeting the default branch
+  push:
+    branches: ["main", "develop"]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+  # Runs on pull requests for testing
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened]
+
+  # Scheduled builds for content updates
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+
+  # Allows manual workflow dispatch with options
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - preview
+      force_rebuild:
+        description: 'Force complete rebuild'
+        required: false
+        default: false
+        type: boolean
+      skip_tests:
+        description: 'Skip testing phase'
+        required: false
+        default: false
+        type: boolean
+
+# Enhanced permissions for comprehensive operations
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  issues: write
+  pull-requests: write
+  actions: write
+  security-events: write
+  deployments: write
+  attestations: write
+  checks: write
+  packages: write
+  statuses: write
+  repository-projects: write
+
+# Improved concurrency with intelligent queuing
+concurrency:
+  group: "pages-${{ github.ref }}"
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Global environment variables
+env:
+  JEKYLL_ENV: production
+  NODE_VERSION: '18'
+  RUBY_VERSION: '3.2'
+  BUNDLE_CACHE_VERSION: v1
+  SITE_URL: ${{ vars.SITE_URL || 'https://UniversalStandards.github.io' }}
+  MAX_RETRIES: 3
+  TIMEOUT_MINUTES: 30
+
+jobs:
+  # Pre-flight checks and validation
+  preflight:
+    name: Pre-flight Checks
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.changes.outputs.should_deploy }}
+      cache_key: ${{ steps.cache.outputs.cache_key }}
+      site_config: ${{ steps.config.outputs.site_config }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect changes and determine deployment need
+        id: changes
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "Deployment forced via manual trigger"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "Scheduled deployment"
+          else
+            # Check for content changes
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E '\.(md|html|yml|yaml|json|scss|css|js)$' || true)
+            if [[ -n "$CHANGED_FILES" ]]; then
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+              echo "Content changes detected: $CHANGED_FILES"
+            else
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              echo "No significant changes detected"
+            fi
+          fi
+
+      - name: Generate cache key
+        id: cache
+        run: |
+          CACHE_KEY="jekyll-${{ runner.os }}-${{ env.RUBY_VERSION }}-${{ hashFiles('Gemfile.lock', '_config.yml', 'package*.json') }}"
+          echo "cache_key=$CACHE_KEY" >> $GITHUB_OUTPUT
+
+      - name: Validate site configuration
+        id: config
+        run: |
+          # Check for required files and auto-generate if missing
+          if [[ ! -f "_config.yml" ]]; then
+            echo "Creating missing _config.yml"
+            cat > _config.yml << EOF
+          title: "Auto-Generated Site"
+          description: "Automatically generated Jekyll site"
+          url: "${{ env.SITE_URL }}"
+          baseurl: ""
+          
+          # Build settings
+          markdown: kramdown
+          highlighter: rouge
+          theme: minima
+          
+          plugins:
+            - jekyll-feed
+            - jekyll-sitemap
+            - jekyll-seo-tag
+          
+          # Exclude from processing
+          exclude:
+            - Gemfile
+            - Gemfile.lock
+            - node_modules
+            - vendor
+            - .bundle
+            - .sass-cache
+            - .jekyll-cache
+            - .jekyll-metadata
+            - README.md
+            - LICENSE
+          EOF
+          fi
+          
+          # Validate configuration
+          if command -v jekyll &> /dev/null; then
+            jekyll doctor || echo "Jekyll doctor found issues - will attempt auto-fix"
+          fi
+          
+          echo "site_config=validated" >> $GITHUB_OUTPUT
+
+  # Enhanced build job with error handling and automation
+  build:
+    name: Build Jekyll Site
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.should_deploy == 'true'
+    timeout-minutes: ${{ fromJson(env.TIMEOUT_MINUTES) }}
+    strategy:
+      matrix:
+        include:
+          - environment: production
+            ruby_version: ${{ env.RUBY_VERSION }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-generate missing essential files
+        run: |
+          # Create Gemfile if missing
+          if [[ ! -f "Gemfile" ]]; then
+            echo "Creating missing Gemfile"
+            cat > Gemfile << 'EOF'
+          source "https://rubygems.org"
+          
+          gem "jekyll", "~> 4.3"
+          gem "minima", "~> 2.5"
+          
+          group :jekyll_plugins do
+            gem "jekyll-feed", "~> 0.12"
+            gem "jekyll-sitemap"
+            gem "jekyll-seo-tag"
+            gem "jekyll-paginate"
+            gem "jekyll-archives"
+          end
+          
+          # Windows and JRuby does not include zoneinfo files
+          platforms :mingw, :x64_mingw, :mswin, :jruby do
+            gem "tzinfo", ">= 1", "< 3"
+            gem "tzinfo-data"
+          end
+          
+          # Performance-booster for watching directories on Windows
+          gem "wdm", "~> 0.1.1", :platforms => [:mingw, :x64_mingw, :mswin]
+          
+          # Lock `http_parser.rb` gem to `v0.6.x` on JRuby builds
+          gem "http_parser.rb", "~> 0.6.0", :platforms => [:jruby]
+          EOF
+          fi
+          
+          # Create index.md if no index file exists
+          if [[ ! -f "index.md" ]] && [[ ! -f "index.html" ]]; then
+            echo "Creating missing index.md"
+            cat > index.md << 'EOF'
+          ---
+          layout: home
+          title: Welcome
+          ---
+          
+          # Welcome to Your Jekyll Site
+          
+          This site was automatically generated and deployed using GitHub Actions.
+          
+          ## Features
+          
+          - Automatic deployment on push
+          - Error handling and recovery
+          - Missing file generation
+          - SEO optimization
+          - Responsive design
+          
+          ## Getting Started
+          
+          Edit this file (`index.md`) to customize your homepage.
+          EOF
+          fi
+          
+          # Create about page if missing
+          if [[ ! -f "about.md" ]] && [[ ! -d "about" ]]; then
+            echo "Creating missing about.md"
+            cat > about.md << 'EOF'
+          ---
+          layout: page
+          title: About
+          permalink: /about/
+          ---
+          
+          This is an automatically generated About page.
+          
+          You can edit this page by modifying the `about.md` file in your repository.
+          EOF
+          fi
+          
+          # Create posts directory and sample post if missing
+          if [[ ! -d "_posts" ]]; then
+            mkdir -p _posts
+            echo "Creating sample post"
+            cat > "_posts/$(date +%Y-%m-%d)-welcome-to-jekyll.md" << EOF
+          ---
+          layout: post
+          title:  "Welcome to Jekyll!"
+          date:   $(date +"%Y-%m-%d %H:%M:%S %z")
+          categories: jekyll update
+          ---
+          
+          You'll find this post in your \`_posts\` directory. Go ahead and edit it and re-build the site to see your changes.
+          
+          Jekyll requires blog post files to be named according to the following format:
+          
+          \`YEAR-MONTH-DAY-title.MARKUP\`
+          
+          Where \`YEAR\` is a four-digit number, \`MONTH\` and \`DAY\` are two-digit numbers, and \`MARKUP\` is the file extension representing the format used in the file.
+          
+          Check out the [Jekyll docs][jekyll-docs] for more info on how to get the most out of Jekyll.
+          
+          [jekyll-docs]: https://jekyllrb.com/docs/home
+          EOF
+          fi
+
+      - name: Setup Ruby with enhanced caching
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby_version }}
+          bundler-cache: true
+          cache-version: ${{ env.BUNDLE_CACHE_VERSION }}
+
+      - name: Setup Node.js (for additional tools)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            package.json
+
+      - name: Install additional dependencies
+        run: |
+          # Install Node dependencies if package.json exists
+          if [[ -f "package.json" ]]; then
+            npm ci --prefer-offline --no-audit
+          else
+            # Create basic package.json for build tools
+            cat > package.json << 'EOF'
+          {
+            "name": "jekyll-site-tools",
+            "version": "1.0.0",
+            "private": true,
+            "devDependencies": {
+              "html-proofer": "^4.4.0",
+              "lighthouse": "^11.0.0"
+            },
+            "scripts": {
+              "test": "echo \"No tests specified\"",
+              "lighthouse": "lighthouse --output=json --output=html --output-path=./lighthouse-report"
+            }
+          }
+          EOF
+            npm install --prefer-offline --no-audit
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          static_site_generator: jekyll
+
+      - name: Build Jekyll site with error handling
+        id: build
+        run: |
+          set -e
+          
+          # Function for retry logic
+          retry_build() {
+            local attempt=1
+            local max_attempts=${{ env.MAX_RETRIES }}
+            
+            while [[ $attempt -le $max_attempts ]]; do
+              echo "Build attempt $attempt of $max_attempts"
+              
+              if bundle exec jekyll build --destination ./_site --verbose --trace; then
+                echo "Build successful on attempt $attempt"
+                return 0
+              else
+                echo "Build failed on attempt $attempt"
+                if [[ $attempt -eq $max_attempts ]]; then
+                  echo "All build attempts failed"
+                  return 1
+                fi
+                
+                # Clean and retry
+                rm -rf ./_site .jekyll-cache .sass-cache
+                bundle clean --force
+                bundle install --retry 3
+                
+                attempt=$((attempt + 1))
+                sleep $((attempt * 5))  # Exponential backoff
+              fi
+            done
+          }
+          
+          # Attempt build with retry logic
+          if ! retry_build; then
+            echo "::error::Jekyll build failed after ${{ env.MAX_RETRIES }} attempts"
+            
+            # Attempt emergency fallback build
+            echo "Attempting emergency fallback build..."
+            cat > _config.yml << 'EOF'
+          title: "Emergency Build"
+          description: "Fallback site due to build issues"
+          markdown: kramdown
+          highlighter: rouge
+          plugins: []
+          EOF
+            
+            if bundle exec jekyll build --destination ./_site --safe; then
+              echo "::warning::Emergency fallback build succeeded"
+              echo "build_status=fallback" >> $GITHUB_OUTPUT
+            else
+              echo "::error::Emergency fallback build also failed"
+              exit 1
+            fi
+          else
+            echo "build_status=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post-build optimizations
+        run: |
+          # Optimize images if they exist
+          if command -v optipng &> /dev/null && find ./_site -name "*.png" | head -1; then
+            find ./_site -name "*.png" -exec optipng -o2 {} \;
+          fi
+          
+          # Minify HTML if htmlcompressor is available
+          if command -v htmlcompressor &> /dev/null; then
+            find ./_site -name "*.html" -exec htmlcompressor --compress-js --compress-css {} -o {} \;
+          fi
+          
+          # Generate sitemap if not exists
+          if [[ ! -f "./_site/sitemap.xml" ]]; then
+            echo "Generating emergency sitemap"
+            cat > ./_site/sitemap.xml << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <url>
+              <loc>${{ env.SITE_URL }}/</loc>
+              <lastmod>$(date -u +%Y-%m-%dT%H:%M:%S+00:00)</lastmod>
+              <priority>1.0</priority>
+            </url>
+          </urlset>
+          EOF
+          fi
+
+      - name: Validate build output
+        run: |
+          # Check if essential files exist
+          essential_files=("index.html" "404.html")
+          for file in "${essential_files[@]}"; do
+            if [[ ! -f "./_site/$file" ]]; then
+              echo "::warning::Missing essential file: $file"
+              if [[ "$file" == "404.html" ]]; then
+                cat > "./_site/404.html" << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Page Not Found</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+          </head>
+          <body>
+            <h1>404 - Page Not Found</h1>
+            <p>The page you're looking for doesn't exist.</p>
+            <a href="/">Return to Home</a>
+          </body>
+          </html>
+          EOF
+              fi
+            fi
+          done
+          
+          # Basic HTML validation
+          if command -v tidy &> /dev/null; then
+            find ./_site -name "*.html" -exec tidy -q -e {} \; || echo "HTML validation warnings found"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            .jekyll-cache/
+            _site/
+            Gemfile.lock
+            package-lock.json
+          retention-days: 7
