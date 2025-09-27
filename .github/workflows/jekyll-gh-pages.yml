@@ -9,6 +9,20 @@ on:
       - 'README.md'
       - 'LICENSE'
       - '.gitignore'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  issues: write
+  pull-requests: write
+  actions: write
+  security-events: write
+  deployments: write
+  attestations: write
+  checks: write
+  packages: write
+  statuses: write
+  repository-projects: write
 
   # Runs on pull requests for testing
   pull_request:
